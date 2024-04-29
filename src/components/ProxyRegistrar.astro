@@ -1,0 +1,348 @@
+<script>
+  import { TransportMgr, initTransport, loadSelectedTransportScript } from "./ts/TransportManager";
+  import "notyf/notyf.min.css";
+  import { Notyf } from "notyf";
+
+  let form = document.querySelector("form");
+  let input = document.querySelector("input");
+  document.addEventListener("astro:after-swap", initForm);
+  function initForm() {
+    let formEle = document.querySelector("form");
+    input = document.querySelector("input");
+    if (formEle) formEle.addEventListener("submit", formEventListener);
+  }
+  if (form) {
+    form.addEventListener("submit", formEventListener);
+  }
+
+  setInterval(() => {
+    let iframe = document.getElementById("proxy-frame") as HTMLIFrameElement;
+    if (iframe && iframe.src != "") {
+      updateProxiedFavicon(iframe);
+      updateTopbarTitle(iframe);
+    }
+  }, 500);
+
+  async function getProxyURL() {
+    let preference = getProxyPreference();
+    let url = input!.value.trim();
+    if (!isUrl(url)) url = getSearchEngine() + url;
+    else if (!(url.startsWith("https://") || url.startsWith("http://"))) url = "http://" + url;
+    if (preference === "ultraviolet") {
+      return window.__uv$config.prefix + window.__uv$config.encodeUrl(url);
+    } else if (preference == "rammerhead") {
+      // Check if rammerhead-session exists in cookies
+      let rammerheadSession = getCookie("rammerhead-session");
+      if (!rammerheadSession) {
+        let session = await fetch("/newsession");
+        let sessionID = await session.text();
+        await fetch("/editsession?id=" + sessionID + "&enableShuffling=0");
+        // Now save it in a cookie that expires in 72 hours.
+        document.cookie = `rammerhead-session=${sessionID}; max-age=${60 * 60 * 72}; path=/`;
+      }
+      return `/${getCookie("rammerhead-session")}/${url}`;
+    } else {
+      // Default to UV
+      return window.__uv$config.prefix + window.__uv$config.encodeUrl(url);
+    }
+  }
+
+  async function loadContent() {
+    await initTransport();
+    // The setTimeout is because service workers are a little silly and can take a while longer to register despite .then being called, which causes a bug on the first load.
+    setTimeout(async () => {
+      let openWith = localStorage.getItem("alu__selectedOpenWith");
+      let currentProxy = localStorage.getItem("alu__selectedProxy");
+      let url = input!.value.trim();
+      if (!isUrl(url)) url = getSearchEngine() + url;
+      else if (!(url.startsWith("https://") || url.startsWith("http://"))) url = "http://" + url;
+      if (openWith) {
+        let openWithParsed = JSON.parse(openWith);
+        if (
+          openWithParsed.value === "newTab" ||
+          (currentProxy && JSON.parse(currentProxy).value === "rammerhead")
+        ) {
+          window.open(await getProxyURL(), "_blank");
+          return;
+        }
+        if (openWithParsed.value === "about:blank") {
+          // Open about:blank window and inject iframe into it
+          let newWindow = window.open("about:blank", "_blank");
+          let newWindowDocument = newWindow!.document;
+          let iframe = newWindowDocument.createElement("iframe");
+          iframe.src = await getProxyURL();
+          // Inject css into the iframe
+          let css = newWindowDocument.createElement("link");
+          css.rel = "stylesheet";
+          css.href = "/iframe.css";
+          newWindowDocument.head.appendChild(css);
+          newWindowDocument.body.appendChild(iframe);
+          return;
+        }
+      }
+      let loadingContent = document.getElementById("loading-content") as HTMLElement;
+      if (loadingContent) loadingContent.style.opacity = "1";
+
+      let iframe = document.getElementById("proxy-frame") as HTMLIFrameElement;
+      let topbar = document.getElementById("top-bar") as HTMLDivElement;
+      let closeButton = document.getElementById("close-button") as HTMLButtonElement;
+      let backwardsButton = document.getElementById("nav-backwards") as HTMLImageElement;
+      let forwardsButton = document.getElementById("nav-forwards") as HTMLImageElement;
+      let shareButton = document.getElementById("nav-share") as HTMLImageElement;
+      let preference = getProxyPreference();
+      if (preference === "ultraviolet") {
+        iframe.src = window.__uv$config.prefix + window.__uv$config.encodeUrl(url);
+      } else if (preference == "rammerhead") {
+        // Check if rammerhead-session exists in cookies
+        let rammerheadSession = getCookie("rammerhead-session");
+        if (!rammerheadSession) {
+          let session = await fetch("/newsession");
+          let sessionID = await session.text();
+          // Disable URL shuffling on rewrite, eventually I'll try and figure out how it works, but for now, it's disabled.
+          await fetch("/editsession?id=" + sessionID + "&enableShuffling=0");
+          // Now save it in a cookie that expires in 72 hours.
+          document.cookie = `rammerhead-session=${sessionID}; max-age=${60 * 60 * 72}; path=/`;
+          // Now add an origin_proxy cookie for our domain
+          document.cookie = `origin_proxy=${window.location.origin}; max-age=${60 * 60 * 72}; path=/`;
+        }
+        if (iframe) iframe.src = `/${getCookie("rammerhead-session")}/${url}`;
+      } else {
+        // Default to UV
+        iframe.src = window.__uv$config.prefix + window.__uv$config.encodeUrl(url);
+      }
+      iframe.style.pointerEvents = "auto";
+      iframe.classList.add("proxy-frame");
+      document.body.appendChild(iframe);
+      setTimeout(() => {
+        iframeLoad(
+          iframe,
+          loadingContent,
+          topbar,
+          closeButton,
+          shareButton,
+          forwardsButton,
+          backwardsButton
+        );
+      }, 500);
+
+      function setActive() {
+        iframe.classList.add("active");
+      }
+
+      function loadExtensionScripts() {
+        try {
+          let db = indexedDB.open("AluDB", 1);
+          db.onsuccess = () => {
+            let transaction = db.result.transaction("InstalledExtensions", "readonly");
+            let store = transaction.objectStore("InstalledExtensions");
+            let request = store.getAll();
+            request.onsuccess = () => {
+              let extensions = request.result;
+              extensions.forEach((extension: any) => {
+                // Eval the extension script inside of the iframe
+                if (extension.serviceWorkerExtension) return;
+                if (iframe.contentWindow) {
+                  console.log(`Evaluating extension "${extension.title}" inside of the iframe.`);
+                  (iframe.contentWindow as any).eval(atob(extension.script));
+                }
+              });
+            };
+          };
+        } catch (err) {
+          console.error(`Failed load extension scripts: ${err}`);
+        }
+      }
+
+      function iframeLoad(
+        iframe: HTMLIFrameElement,
+        loadingContent: HTMLElement,
+        topbar: HTMLDivElement,
+        closeButton: HTMLButtonElement,
+        shareButton: HTMLImageElement,
+        forwardsButton: HTMLImageElement,
+        backwardsButton: HTMLImageElement
+      ) {
+        loadingContent.style.opacity = "0";
+        iframe.style.opacity = "1";
+        topbar.style.opacity = "1";
+        topbar.style.pointerEvents = "auto";
+        document.body.style.overflow = "hidden";
+        iframe.addEventListener("load", setActive);
+        closeButton.onclick = () => {
+          iframe.style.opacity = "0";
+          topbar.style.opacity = "0";
+          iframe.style.pointerEvents = "none";
+          topbar.style.pointerEvents = "none";
+          document.body.style.overflow = "auto";
+          iframe.classList.remove("active");
+          iframe.removeEventListener("load", setActive);
+
+          setTimeout(() => {
+            iframe.src = "about:blank";
+          }, 500);
+        };
+        forwardsButton.onclick = () => {
+          if (iframe.contentWindow) {
+            iframe.contentWindow.history.forward();
+          }
+        };
+        backwardsButton.onclick = () => {
+          if (iframe.contentWindow) {
+            iframe.contentWindow.history.back();
+          }
+        };
+        shareButton.onclick = () => {
+          let currentProxy = localStorage.getItem("alu__selectedProxy");
+          let proxyFrame = document.getElementById('proxy-frame') as HTMLIFrameElement;
+          if (currentProxy && JSON.parse(currentProxy).value === "rammerhead") {
+            navigator.clipboard.writeText(
+              window.location.origin +
+                "/" +
+                getCookie("rammerhead-session") +
+                "/" +
+                input!.value.trim()
+            );
+          } else {
+            navigator.clipboard.writeText(
+              window.__uv$config.decodeUrl(proxyFrame.contentWindow!.location.href.split('/service/')[1])
+            );
+          }
+          new Notyf({
+            duration: 2000,
+            position: { x: "right", y: "bottom" },
+            dismissible: true,
+            ripple: true,
+          }).success("Copied to clipboard!");
+        };
+      }
+    }, 100);
+  }
+
+  async function formEventListener(event: Event) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    await loadSelectedTransportScript();
+    TransportMgr.updateTransport();
+    setTimeout(() => {
+      loadContent();
+    }, 200);
+  }
+  window.loadFormContent = loadContent;
+  window.loadSelectedTransport = loadSelectedTransportScript;
+
+  function isUrl(val = "") {
+    if (/^http(s?):\/\//.test(val) || (val.includes(".") && val.substr(0, 1) !== " ")) return true;
+    return false;
+  }
+
+  function getCookie(name: string) {
+    const value = `; ${document.cookie}`;
+    const parts = value.split(`; ${name}=`);
+    if (parts.length === 2 && parts) {
+      const lastPart = parts.pop();
+      if (lastPart) {
+        return lastPart.split(";").shift();
+      } else {
+        return null;
+      }
+    }
+  }
+
+  function getSearchEngine() {
+    let localStorageSearchEngine = localStorage.getItem("alu__search_engine");
+    if (!localStorageSearchEngine) {
+      return "https://google.com/search?q=";
+    }
+    switch (JSON.parse(localStorage.getItem("alu__search_engine") as string).value.toLowerCase()) {
+      case "google": {
+        return "https://google.com/search?q=";
+      }
+      case "bing": {
+        return "https://bing.com/search?q=d";
+      }
+      case "brave": {
+        return "https://search.brave.com/search?q=";
+      }
+      case "searx": {
+        let localStorageURL = localStorage.getItem("alu__searxngUrl");
+        if (localStorageURL) {
+          if (localStorageURL == "") return "https://searxng.site/search?q=";
+          // Ugly hack to remove the trailing slash :)
+          if (localStorageURL.endsWith("/")) localStorageURL = localStorageURL.slice(0, -1);
+          return localStorageURL + "/search?q=";
+        } else return "https://searxng.site/search?q=";
+      }
+      default: {
+        return "https://google.com/search?q=";
+      }
+    }
+  }
+
+  function getProxyPreference() {
+    let localStorageItem = localStorage.getItem("alu__selectedProxy");
+
+    if (!localStorageItem) return "uv";
+
+    switch (JSON.parse(localStorageItem).value.toLowerCase()) {
+      case "ultraviolet":
+        return "ultraviolet";
+      case "rammerhead":
+        return "rammerhead";
+      default:
+        return "uv";
+    }
+  }
+
+  function updateProxiedFavicon(iframe: HTMLIFrameElement, hasErrored = false) {
+    if (!iframe) return;
+    let proxiedFavicon = document.getElementById("proxied-favicon") as HTMLImageElement;
+    if (iframe) {
+      if (iframe.contentDocument) {
+        let favicon =
+          (iframe.contentDocument.querySelector("link[rel='icon']") as HTMLLinkElement) ||
+          (iframe.contentDocument.querySelector("link[rel*='icon']") as HTMLLinkElement);
+        if (favicon && favicon.href) {
+          let encodedHREF = encodeURIComponent(favicon.href);
+          if (favicon.href.includes("data:image")) {
+            proxiedFavicon.src = favicon.href;
+            return;
+          }
+          if (
+            proxiedFavicon.src ==
+            `${window.location.origin}/custom-favicon?url=${encodedHREF}&contentType=${favicon.type ? encodeURIComponent(favicon.type) : ""}`
+          )
+            return;
+        }
+        if (favicon) {
+          let encodedHREF = encodeURIComponent(favicon.href);
+          if (favicon.href.includes("data:image")) {
+            proxiedFavicon.src = favicon.href;
+            return;
+          }
+          proxiedFavicon.src = `/custom-favicon?url=${encodedHREF}&contentType=${favicon.type ? encodeURIComponent(favicon.type) : ""}`;
+          proxiedFavicon.addEventListener("error", () => {
+            proxiedFavicon.src = "/favicon.ico";
+          });
+        } else {
+          if (proxiedFavicon.src != window.location.origin + "/favicon.ico") {
+            proxiedFavicon.src = "/favicon.ico";
+          }
+        }
+        return;
+      }
+    }
+  }
+  function updateTopbarTitle(iframe: HTMLIFrameElement) {
+    if (!iframe.contentDocument) return;
+    let topbarTitle = document.getElementById("url-text") as HTMLElement;
+    if (iframe.contentDocument.title == "") {
+      topbarTitle.innerText = "Loading...";
+    } else {
+      if (iframe.contentDocument.title.length > 65) {
+        topbarTitle.innerText = iframe.contentDocument.title.slice(0, 65) + "...";
+        return;
+      }
+      topbarTitle.innerText = iframe.contentDocument.title;
+    }
+  }
+</script>
